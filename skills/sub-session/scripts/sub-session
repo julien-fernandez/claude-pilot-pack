@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+PILOT_DIR = Path(os.environ.get("PILOT_DIR", Path.home() / ".local" / "state" / "claude-pilot"))
+REGISTRY = PILOT_DIR / "sub-sessions.tsv"
+CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
+PILOT = os.environ.get("PILOT_NAME", "pilot")
+
+STANDING = """
+---
+Standing instructions (added by sub-session launch):
+- You are the sub-session "{slug}", launched by the pilot "{pilot}".
+- Never ask the human anything. For each decision you need, run
+  q new --source {slug} --reco "<your recommendation>" "<question>"
+  then SendMessage to "{pilot}": the Q number, one line on what is done so far, options, recommendation.
+  Keep working on the rest while you wait.
+- Update your state file at every step: what is done with its proof, next step, cost so far.
+- At the budget ceiling, write your state file and stop.
+- At the end, store your report:
+  sub-session report {slug} <<'EOF'
+  ## Produced
+  ## Verified
+  ## Not verified
+  ## Cost
+  ## Lessons
+  Closing: closable now | closable after <condition> | not closable: <what is left>
+  EOF
+  then SendMessage to "{pilot}" a summary of 8 lines at most.
+"""
+
+
+BRIEF_FIELDS = ("Goal", "Budget", "Forbidden", "Proof", "State file")
+REPORT_SECTIONS = ("Produced", "Verified", "Not verified", "Cost", "Lessons")
+
+
+def filled(value):
+    value = value.strip()
+    return bool(value) and not value.startswith("<")
+
+
+def has_field(text, field):
+    name = re.escape(field)
+    for m in re.finditer(rf"^\s*(?:[-*]\s+)?\**\s*{name}\s*:\**(.*)$", text, re.M | re.I):
+        if filled(m.group(1)):
+            return True
+    for m in re.finditer(rf"^\s*##\s*{name}\s*\n((?:\s*\n)*)(.*)$", text, re.M | re.I):
+        if filled(m.group(2)) and not m.group(2).lstrip().startswith("#"):
+            return True
+    return False
+
+
+def cmd_launch(args):
+    brief = Path(args.brief).read_text(encoding="utf-8")
+    check_slug(args.slug)
+    missing = [f for f in BRIEF_FIELDS if not has_field(brief, f)]
+    if missing:
+        sys.exit(f"sub-session: brief refused, missing: {', '.join(missing)} "
+                 "(one 'Field: …' line or '## Field' heading each)")
+    prompt = brief + STANDING.format(slug=args.slug, pilot=PILOT)
+    result = subprocess.run([CLAUDE, "--bg", "--name", args.slug, prompt],
+                            cwd=args.repo, capture_output=True, text=True)
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    if result.returncode:
+        sys.exit(result.returncode)
+    PILOT_DIR.mkdir(parents=True, exist_ok=True)
+    started = dt.datetime.now().isoformat(timespec="seconds")
+    repo = str(Path(args.repo).resolve())
+    with open(REGISTRY, "a", encoding="utf-8") as f:
+        f.write("\t".join([started, args.slug, repo, str(Path(args.brief).resolve())]) + "\n")
+
+
+SLUG = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+
+def check_slug(slug):
+    if not SLUG.match(slug):
+        sys.exit(f"sub-session: slug refused ({slug!r}): lowercase letters, digits and dashes only")
+
+
+def section_body(text, section):
+    m = re.search(rf"^##\s*{re.escape(section)}\s*\n(.*?)(?=^##\s|^Closing:|\Z)", text, re.M | re.I | re.S)
+    return None if m is None else m.group(1)
+
+
+def report_path(slug, day):
+    return PILOT_DIR / "reports" / f"{day}-{slug}.md"
+
+
+def cmd_report(args):
+    text = sys.stdin.read()
+    check_slug(args.slug)
+    missing = [s for s in REPORT_SECTIONS if not filled(section_body(text, s) or "")]
+    if not re.search(r"^Closing:\s*\S", text, re.M):
+        missing.append("Closing: line")
+    if missing:
+        sys.exit(f"sub-session: report refused, missing: {', '.join(missing)}")
+    path = report_path(args.slug, dt.date.today().isoformat())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    print(path)
+
+
+def cmd_list(args):
+    if not REGISTRY.exists():
+        return
+    day = args.day
+    for line in REGISTRY.read_text(encoding="utf-8").splitlines():
+        started, slug, repo, _brief = line.split("\t")
+        if not started.startswith(day):
+            continue
+        status = "reported" if report_path(slug, day).exists() else "running or silent"
+        print(f"{started}  {slug}  [{status}]  {repo}")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="sub-session")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    launch = sub.add_parser("launch")
+    launch.add_argument("slug")
+    launch.add_argument("repo")
+    launch.add_argument("brief")
+    launch.set_defaults(func=cmd_launch)
+    report = sub.add_parser("report", help="store the final report read on stdin")
+    report.add_argument("slug")
+    report.set_defaults(func=cmd_report)
+    listing = sub.add_parser("list", help="launches of a day and whether they reported")
+    listing.add_argument("--day", default=dt.date.today().isoformat())
+    listing.set_defaults(func=cmd_list)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

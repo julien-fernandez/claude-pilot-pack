@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import sys
+from pathlib import Path
+
+DIR = Path(os.environ.get("PILOT_DIR", Path.home() / ".local" / "state" / "claude-pilot")) / "questions"
+
+
+def today():
+    return dt.date.today().isoformat()
+
+
+def now():
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def day_file(day):
+    return DIR / f"{day}.jsonl"
+
+
+def load(day):
+    state = {}
+    path = day_file(day)
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+                state.setdefault(event["q"], {}).update(event)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+    return state
+
+
+def append(day, make_event):
+    DIR.mkdir(parents=True, exist_ok=True)
+    with open(DIR / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        event = make_event(load(day))
+        with open(day_file(day), "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    return event
+
+
+def key(q):
+    return tuple(int(x) for x in q[1:].split("."))
+
+
+def cmd_new(args):
+    def event(state):
+        if args.parent:
+            parent = args.parent.upper()
+            if parent not in state:
+                sys.exit(f"q: {parent} does not exist on {args.day}")
+            children = [key(q)[-1] for q in state if q.startswith(parent + ".")]
+            number = f"{parent}.{max(children, default=0) + 1}"
+        else:
+            number = f"Q{max((key(q)[0] for q in state), default=0) + 1}"
+        return {"q": number, "event": "new", "at": now(), "source": args.source,
+                "text": args.text, "reco": args.reco, "status": "open"}
+    print(append(args.day, event)["q"])
+
+
+def cmd_answer(args):
+    number = args.q.upper()
+
+    def event(state):
+        if number not in state:
+            sys.exit(f"q: {number} does not exist on {args.day}")
+        return {"q": number, "event": "answer", "answered_at": now(), "answer": args.answer, "status": "answered"}
+    append(args.day, event)
+    print(f"{number} answered")
+
+
+def cmd_list(args):
+    days = sorted(f.stem for f in DIR.glob("*.jsonl")) if args.open and not args.day else [args.day or today()]
+    for day in days:
+        list_day(day, args.open, prefix=f"{day} " if day != today() else "")
+
+
+def list_day(day, only_open, prefix=""):
+    state = load(day)
+    for number in sorted(state, key=key):
+        item = state[number]
+        if only_open and item.get("status") != "open":
+            continue
+        line = f"{prefix}{number} [{item.get('status')}] ({item.get('source')}) {item.get('text')}"
+        if item.get("reco"):
+            line += f" | reco: {item['reco']}"
+        if item.get("answer"):
+            line += f" | answer: {item['answer']}"
+        print(line)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="q", description="Daily numbered question registry")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    new = sub.add_parser("new")
+    new.add_argument("--source", required=True)
+    new.add_argument("--reco")
+    new.add_argument("--parent")
+    new.add_argument("--day", default=today())
+    new.add_argument("text")
+    new.set_defaults(func=cmd_new)
+    answer = sub.add_parser("answer")
+    answer.add_argument("--day", default=today())
+    answer.add_argument("q")
+    answer.add_argument("answer")
+    answer.set_defaults(func=cmd_answer)
+    listing = sub.add_parser("list")
+    listing.add_argument("--open", action="store_true")
+    listing.add_argument("--day", help="default: today; with --open and no --day, every day")
+    listing.set_defaults(func=cmd_list)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
